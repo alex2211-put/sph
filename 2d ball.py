@@ -1,206 +1,322 @@
-"""A sphere of density 500 falling into a hydrostatic tank (15 minutes)
-Check basic equations of SPH to throw a ball inside the vessel
-"""
-from __future__ import print_function
-import numpy as np
-
-# PySPH base and carray imports
-from pysph.base.utils import (get_particle_array_wcsph,
-                              get_particle_array_rigid_body)
-from pysph.base.kernels import CubicSpline
-
-from pysph.solver.solver import Solver
-from pysph.sph.integrator import EPECIntegrator
-from pysph.sph.integrator_step import WCSPHStep
-
+import numpy
+import gmsh
+# SPH equations
 from pysph.sph.equation import Group
-from pysph.sph.basic_equations import (XSPHCorrection, ContinuityEquation,
-                                       SummationDensity)
-from pysph.sph.wc.basic import TaitEOSHGCorrection, MomentumEquation
+
+from pysph.sph.basic_equations import IsothermalEOS, ContinuityEquation, MonaghanArtificialViscosity, \
+    XSPHCorrection, VelocityGradient3D
+
+from pysph.sph.solid_mech.basic import MomentumEquationWithStress, HookesDeviatoricStressRate, \
+    MonaghanArtificialStress, EnergyEquationWithStress
+
+from pysph.sph.solid_mech.hvi import VonMisesPlasticity2D, MieGruneisenEOS, StiffenedGasEOS
+
+from pysph.sph.gas_dynamics.basic import UpdateSmoothingLengthFromVolume
+
+from pysph.base.utils import get_particle_array
+from pysph.base.kernels import Gaussian, CubicSpline, WendlandQuintic
 from pysph.solver.application import Application
-from pysph.sph.rigid_body import (BodyForce, RigidBodyCollision, LiuFluidForce,
-                                  RigidBodyMoments, RigidBodyMotion,
-                                  RK2StepRigidBody)
-from pysph.tools import gmsh
+from pysph.solver.solver import Solver
+from pysph.sph.integrator import PECIntegrator, EPECIntegrator
+from pysph.sph.integrator_step import SolidMechStep
 
 
-def create_boundary():
-    dx = 2
-
-    # bottom particles in tank
-    xb = np.arange(-2 * dx, 300 + 2 * dx, dx)
-    yb = np.arange(-10, 0, dx)
-    xb, yb = np.meshgrid(xb, yb)
-    xb = xb.ravel()
-    yb = yb.ravel()
+def add_properties(pa, *props):
+    for prop in props:
+        pa.add_property(name=prop)
 
 
-    x = np.concatenate([xb])
-    y = np.concatenate([yb])
+# Parameters
+dx = dy = dz = 0.0005  # m
+hdx = 1.3
+h = hdx * dx
+r = 0.005
 
-    return x * 1e-3, y * 1e-3
+######################################################################
+# Material properties: Table (1) of "A Free Lagrange Augmented Godunov Method
+# for the Simulation of Elastic-Plastic Solids", B. P. Howell and G. J. Ball,
+# JCP (2002)
+
+# ALUMINIUM
+ro1 = 2785.0  # refenrence density
+C1 = 5328.0  # reference sound-speed
+S1 = 1.338  # Particle-shock velocity slope
+gamma1 = 2.0  # Gruneisen gamma/parameter
+G1 = 2.76e7  # Shear Modulus (kPa)
+Yo1 = 0.3e6  # Yield stress
+E1 = ro1 * C1 * C1  # Youngs Modulus
+
+# STEEL
+ro2 = 7900.0  # reference density
+C2 = 4600.0  # reference sound-speed
+S2 = 1.490  # Particle shock velocity slope
+gamma2 = 2.17  # Gruneisen gamma/parameter
+G2 = 8.530e7  # Shear modulus
+Yo2 = 0.979e6  # Yield stress
+E2 = ro2 * C2 * C2  # Youngs modulus
+
+# general
+v_s = 3100.0  # Projectile velocity 3.1 km/s
+cs1 = numpy.sqrt(E1 / ro1)  # speed of sound in aluminium
+cs2 = numpy.sqrt(E2 / ro2)  # speed of sound in steel
+
+######################################################################
+# SPH constants and parameters
+
+# Monaghan-type artificial viscosity
+avisc_alpha = 1.0
+avisc_beta = 1.5
+avisc_eta = 0.1
+
+# XSPH epsilon
+xsph_eps = 0.5
+
+# SAV1 artificial viscosity coefficients
+alpha1 = 1.0
+beta1 = 1.5
+eta = 0.1  # in piab equation eta2 was written so final value is 0.01.(as req.)
+
+# SAV2
+alpha2 = 2.5
+beta2 = 2.5
+eta = 0.1  # in piab equation eta2 was written so final value is 0.01.(as req.)
+
+# XSPH
+eps = 0.5
 
 
-def create_fluid():
-    dx = 2
-    xf = np.arange(0, 300, dx)
-    yf = np.arange(0, 150, dx)
-    xf, yf = np.meshgrid(xf, yf)
-    xf = xf.ravel()
-    yf = yf.ravel()
-
-    return xf * 1e-3, yf * 1e-3
-
-
-def create_sphere(dx=1):
-    x = np.arange(-100, 100, dx)
-    y = np.arange(0, 150, dx)
-    x, y = np.meshgrid(x, y)
+######################################################################
+# Particle creation rouintes
+def get_projectile_particles():
+    x, y, z = numpy.mgrid[-r:r + 1e-6:dx, -r:r + 1e-6:dx, -r:r + 1e-6:dx]
     x = x.ravel()
     y = y.ravel()
+    z = z.ravel()
 
-    p = ((x + 75)**2 + (y - 70)**2) < 10**2
-    x = x[p]
-    y = y[p]
+    d = (x * x + y * y + z * z)
+    keep = numpy.flatnonzero(d <= r * r)
+    x = x[keep]
+    y = y[keep]
+    z = z[keep]
 
-    # lower sphere a little
-    y = y - 20
-    return x * 1e-3, y * 1e-3
+    x = x - (r + 2 * dx)
+    print('%d Projectile particles' % len(x))
+
+    hf = numpy.ones_like(x) * h
+    mf = numpy.ones_like(x) * dx * dy * dz * ro2
+    rhof = numpy.ones_like(x) * ro2
+    csf = numpy.ones_like(x) * cs2
+    u = numpy.ones_like(z) * v_s
+
+    pa = projectile = get_particle_array(
+        name="projectile", x=x, y=y, z=z, h=hf, m=mf, rho=rhof, cs=csf, uz=u)
+
+    # add requisite properties
+    # sound speed etc.
+    add_properties(pa, 'e')
+
+    # velocity gradient properties
+    add_properties(pa, 'v00', 'v01', 'v02', 'v10', 'v11', 'v12', 'v20', 'v21', 'v22')
+
+    # artificial stress properties
+    add_properties(pa, 'r00', 'r01', 'r02', 'r11', 'r12', 'r22')
+
+    # deviatoric stress components
+    add_properties(pa, 's00', 's01', 's02', 's11', 's12', 's22')
+
+    # deviatoric stress accelerations
+    add_properties(pa, 'as00', 'as01', 'as02', 'as11', 'as12', 'as22')
+
+    # deviatoric stress initial values
+    add_properties(pa, 's000', 's010', 's020', 's110', 's120', 's220')
+
+    # standard acceleration variables
+    add_properties(pa, 'arho', 'au', 'av', 'aw', 'ax', 'ay', 'az', 'ae')
+
+    # initial values
+    add_properties(pa, 'rho0', 'u0', 'v0', 'w0', 'x0', 'y0', 'z0', 'e0')
+
+    pa.add_constant('G', G2)
+    pa.add_constant('n', 4)
+
+    kernel = Gaussian(dim=3)
+    wdeltap = kernel.kernel(rij=dx, h=hdx * dx)
+    pa.add_constant('wdeltap', wdeltap)
+
+    # load balancing properties
+    pa.set_lb_props(list(pa.properties.keys()))
+
+    return projectile
 
 
-def get_density(y):
-    height = 150
-    c_0 = 2 * np.sqrt(2 * 9.81 * height * 1e-3)
-    rho_0 = 1000
-    height_water_clmn = height * 1e-3
-    gamma = 7.
-    _tmp = gamma / (rho_0 * c_0**2)
+def get_plate_particles():
+    gmsh.initialize()
+    gmsh.open('t.msh')
+    # Launch the GUI to see the results:
+    # if '-nopopup' not in sys.argv:
+    #     gmsh.fltk.run()
 
-    rho = np.zeros_like(y)
-    for i in range(len(rho)):
-        p_i = rho_0 * 9.81 * (height_water_clmn - y[i])
-        rho[i] = rho_0 * (1 + p_i * _tmp)**(1. / gamma)
-    return rho
+    nodeTags, nodesCoord, parametricCoord = gmsh.model.mesh.getNodes()
+    liquid_x = nodesCoord[1::3]
+    liquid_y = nodesCoord[2::3]
+    liquid_z = nodesCoord[0::3]
+    liquid_y = liquid_y + abs(min(liquid_y))
+    liquid_x = liquid_x + abs(min(liquid_x))
+
+    liquid_x = liquid_x[0::5] * 1e-3 - 0.002
+    liquid_y = liquid_y[0::5] * 1e-3 - 0.1
+    liquid_z = liquid_z[0::5] * 1e-3 - 0.005
+
+    print('%d Target particles' % len(liquid_x))
+
+    hf = numpy.ones_like(liquid_x) * h
+    mf = numpy.ones_like(liquid_x) * dx * dy * dz * ro1
+    rhof = numpy.ones_like(liquid_x) * ro1
+    csf = numpy.ones_like(liquid_x) * cs1
+    pa = plate = get_particle_array(name="plate",
+                                    x=liquid_x, y=liquid_y, z=liquid_z, h=hf, m=mf, rho=rhof, cs=csf)
+
+    # add requisite properties
+    # sound speed etc.
+    add_properties(pa, 'e')
+
+    # velocity gradient properties
+    add_properties(pa, 'v00', 'v01', 'v02', 'v10', 'v11', 'v12', 'v20', 'v21', 'v22')
+
+    # artificial stress properties
+    add_properties(pa, 'r00', 'r01', 'r02', 'r11', 'r12', 'r22')
+
+    # deviatoric stress components
+    add_properties(pa, 's00', 's01', 's02', 's11', 's12', 's22')
+
+    # deviatoric stress accelerations
+    add_properties(pa, 'as00', 'as01', 'as02', 'as11', 'as12', 'as22')
+
+    # deviatoric stress initial values
+    add_properties(pa, 's000', 's010', 's020', 's110', 's120', 's220')
+
+    # standard acceleration variables
+    add_properties(pa, 'arho', 'au', 'av', 'aw', 'ax', 'ay', 'az', 'ae')
+
+    # initial values
+    add_properties(pa, 'rho0', 'u0', 'v0', 'w0', 'x0', 'y0', 'z0', 'e0')
+
+    pa.add_constant('G', G1)
+    pa.add_constant('n', 4)
+
+    kernel = Gaussian(dim=3)
+    wdeltap = kernel.kernel(rij=dx, h=hdx * dx)
+    pa.add_constant('wdeltap', wdeltap)
+    # load balancing properties
+    pa.set_lb_props(list(pa.properties.keys()))
+
+    # removed S_00 and similar components
+    plate.v[:] = 0.0
+    return plate
 
 
-def geometry():
-    # please run this function to know how
-    # geometry looks like
-    import matplotlib.pyplot as plt
-    x_tank, y_tank = create_boundary()
-    x_fluid, y_fluid = create_fluid()
-    x_cube, y_cube = create_sphere()
-    plt.scatter(x_fluid, y_fluid)
-    plt.scatter(x_tank, y_tank)
-    plt.scatter(x_cube, y_cube)
-    plt.axes().set_aspect('equal', 'datalim')
-    print("done")
-    plt.show()
-
-
-class RigidFluidCoupling(Application):
-    def initialize(self):
-        self.dx = 2 * 1e-3
-        self.hdx = 1.2
-        self.ro = 1000
-        self.solid_rho = 500
-        self.vx = 10.0
-        self.m = 1000 * self.dx * self.dx
-        self.co = 2 * np.sqrt(2 * 9.81 * 150 * 1e-3)
-        self.alpha = 0.1
-
+class Impact(Application):
     def create_particles(self):
-        """Create the circular patch of fluid."""
-        xf, yf = create_fluid()
-        rho = get_density(yf)
-        m = rho[:] * self.dx * self.dx
-        rho = np.ones_like(xf) * self.ro
-        h = np.ones_like(xf) * self.hdx * self.dx
-        fluid = get_particle_array_wcsph(x=xf, y=yf, h=h, m=m, rho=rho,
-                                         name="fluid")
+        plate = get_plate_particles()
+        projectile = get_projectile_particles()
 
-        xt, yt = create_boundary()
-        m = np.ones_like(xt) * 1000 * self.dx * self.dx
-        rho = np.ones_like(xt) * 1000
-        rad_s = np.ones_like(xt) * 2 / 2. * 1e-3
-        h = np.ones_like(xt) * self.hdx * self.dx
-        tank = get_particle_array_wcsph(x=xt, y=yt, h=h, m=m, rho=rho,
-                                        rad_s=rad_s, name="tank")
-
-        dx = 1
-        xc, yc = create_sphere(1)
-        m = np.ones_like(xc) * self.solid_rho * dx * 1e-3 * dx * 1e-3
-        rho = np.ones_like(xc) * self.solid_rho
-        h = np.ones_like(xc) * self.hdx * self.dx
-        rad_s = np.ones_like(xc) * dx / 2. * 1e-3
-        # add cs property to run the simulation
-        cs = np.zeros_like(xc)
-        cube = get_particle_array_rigid_body(x=xc, y=yc, h=h, m=m, rho=rho,
-                                             rad_s=rad_s, cs=cs, name="cube")
-        cube.vc[0] = self.vx
-
-        return [fluid, tank, cube]
+        return [plate, projectile]
 
     def create_solver(self):
-        kernel = CubicSpline(dim=2)
+        dim = 3
+        kernel = Gaussian(dim=dim)
+        # kernel = WendlandQuintic(dim=dim)
 
-        integrator = EPECIntegrator(fluid=WCSPHStep(), tank=WCSPHStep(),
-                                    cube=RK2StepRigidBody())
+        integrator = EPECIntegrator(projectile=SolidMechStep(), plate=SolidMechStep())
+        solver = Solver(kernel=kernel, dim=dim, integrator=integrator)
 
-        dt = 0.125 * self.dx * self.hdx / (self.co * 1.1) / 2.
-        print("DT: %s" % dt)
-        tf = .7
-        solver = Solver(
-            kernel=kernel,
-            dim=2,
-            integrator=integrator,
-            dt=dt,
-            tf=tf,
-            adaptive_timestep=False, )
-
+        dt = 1e-9
+        tf = 8e-5
+        solver.set_time_step(dt)
+        solver.set_final_time(tf)
+        solver.set_print_freq(100)
         return solver
 
     def create_equations(self):
         equations = [
+
+            # update smoothing length
+            # Group(
+            #     equations = [
+            #         UpdateSmoothingLengthFromVolume(dest='plate',      sources=['plate', 'projectile'], dim=dim, k=hdx),
+            #         UpdateSmoothingLengthFromVolume(dest='projectile', sources=['plate', 'projectile'], dim=dim, k=hdx),
+            #     ],
+            #     update_nnps=True,
+            # ),
+
+            # compute properties from the current state
             Group(
                 equations=[
-                    BodyForce(dest='cube', sources=None, gx=2),
-                    SummationDensity(dest='cube', sources=['fluid', 'cube'])
-                ],
-                real=False),
-            Group(equations=[
-                TaitEOSHGCorrection(dest='cube', sources=None,
-                                    rho0=self.solid_rho, c0=self.co,
-                                    gamma=7.0),
-                TaitEOSHGCorrection(dest='fluid', sources=None, rho0=self.ro,
-                                    c0=self.co, gamma=7.0),
-                TaitEOSHGCorrection(dest='tank', sources=None, rho0=self.ro,
-                                    c0=self.co, gamma=7.0),
-            ], real=False),
-            Group(equations=[
-                ContinuityEquation(
-                    dest='fluid',
-                    sources=['fluid', 'tank', 'cube'], ),
-                ContinuityEquation(
-                    dest='tank',
-                    sources=['fluid', 'tank', 'cube'], ),
-                MomentumEquation(dest='fluid', sources=[
-                    'fluid', 'tank', 'cube'
-                ], alpha=self.alpha, beta=0.0, c0=self.co, gx=0),
-                LiuFluidForce(
-                    dest='fluid',
-                    sources=['cube'], ),
-                XSPHCorrection(dest='fluid', sources=['fluid', 'tank']),
-            ]),
-            Group(equations=[
-                RigidBodyCollision(dest='cube', sources=['tank'], kn=1e5)
-            ]),
-            Group(equations=[RigidBodyMoments(dest='cube', sources=None)]),
-            Group(equations=[RigidBodyMotion(dest='cube', sources=None)]),
-        ]
+                    # EOS (compute the pressure using  one of the EOSs)
+
+                    # MieGruneisenEOS(dest='plate',      sources=None, gamma=gamma1, r0=ro1 , c0=C1, S=S1),
+                    # MieGruneisenEOS(dest='projectile', sources=None, gamma=gamma2, r0=ro2 , c0=C2, S=S2),
+
+                    StiffenedGasEOS(dest='plate', sources=None, gamma=gamma1, r0=ro1, c0=C1),
+                    StiffenedGasEOS(dest='projectile', sources=None, gamma=gamma2, r0=ro2, c0=C2),
+
+                    # compute the velocity gradient tensor
+                    VelocityGradient3D(dest='plate', sources=['plate']),
+                    VelocityGradient3D(dest='projectile', sources=['projectile']),
+
+                    # # stress
+                    VonMisesPlasticity2D(dest='plate', sources=None, flow_stress=Yo1),
+                    VonMisesPlasticity2D(dest='projectile', sources=None, flow_stress=Yo2),
+
+                    # # artificial stress to avoid clumping
+                    MonaghanArtificialStress(dest='plate', sources=None, eps=0.3),
+                    MonaghanArtificialStress(dest='projectile', sources=None, eps=0.3),
+
+                ]
+            ),
+
+            # accelerations (rho, u, v, ...)
+            Group(
+                equations=[
+
+                    # continuity equation
+                    ContinuityEquation(dest='plate', sources=['projectile', 'plate']),
+                    ContinuityEquation(dest='projectile', sources=['projectile', 'plate']),
+
+                    # momentum equation
+                    MomentumEquationWithStress(dest='projectile', sources=['projectile', 'plate', ]),
+                    MomentumEquationWithStress(dest='plate', sources=['projectile', 'plate', ]),
+
+                    # energy equation:
+                    EnergyEquationWithStress(dest='plate', sources=['projectile', 'plate', ],
+                                             alpha=avisc_alpha, beta=avisc_beta, eta=avisc_eta),
+
+                    EnergyEquationWithStress(dest='projectile', sources=['projectile', 'plate', ],
+                                             alpha=avisc_alpha, beta=avisc_beta, eta=avisc_eta),
+
+                    # avisc
+                    MonaghanArtificialViscosity(dest='plate', sources=['projectile', 'plate'],
+                                                alpha=avisc_alpha, beta=avisc_beta),
+
+                    MonaghanArtificialViscosity(dest='projectile', sources=['projectile', 'plate'],
+                                                alpha=avisc_alpha, beta=avisc_beta),
+
+                    # updates to the stress term
+                    HookesDeviatoricStressRate(dest='plate', sources=None, shear_mod=1.),
+                    HookesDeviatoricStressRate(dest='projectile', sources=None, shear_mod=1.),
+
+                    # position stepping
+                    XSPHCorrection(dest='plate', sources=['plate'], eps=xsph_eps),
+                    XSPHCorrection(dest='projectile', sources=['projectile'], eps=xsph_eps),
+
+                ]
+            ),
+
+        ]  # End Group list
+
         return equations
 
 
 if __name__ == '__main__':
-    app = RigidFluidCoupling()
+    app = Impact()
     app.run()

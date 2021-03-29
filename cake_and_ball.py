@@ -3,6 +3,9 @@ Check basic equations of SPH to throw a ball inside the vessel
 """
 from __future__ import print_function
 import numpy as np
+import math
+import os
+import sys
 
 # PySPH base and carray imports
 from pysph.base.utils import (get_particle_array_wcsph,
@@ -21,7 +24,7 @@ from pysph.solver.application import Application
 from pysph.sph.rigid_body import (BodyForce, RigidBodyCollision, LiuFluidForce,
                                   RigidBodyMoments, RigidBodyMotion,
                                   RK2StepRigidBody)
-
+import gmsh
 
 def create_boundary():
     dx = 2
@@ -43,16 +46,30 @@ def create_boundary():
 
 
 def create_fluid():
-    dx = 2
-    xf = np.arange(0, 100, dx)
-    yf = np.arange(0, 30, dx)
-    zf = np.arange(-7, 7, dx)
-    xf, yf, zf = np.meshgrid(xf, yf, zf)
-    xf = xf.ravel()
-    yf = yf.ravel()
-    zf = zf.ravel()
+    dx = 1
+    gmsh.initialize()
+    gmsh.open('t.msh')
+    # Launch the GUI to see the results:
+    # if '-nopopup' not in sys.argv:
+    #     gmsh.fltk.run()
 
-    return xf * 1e-3, yf * 1e-3, zf * 1e-3
+    nodeTags, nodesCoord, parametricCoord = gmsh.model.mesh.getNodes()
+    liquid_x = nodesCoord[0::3]
+    liquid_y = nodesCoord[2::3]
+    liquid_z = nodesCoord[1::3]
+    liquid_y = liquid_y + abs(min(liquid_y))
+    liquid_x = liquid_x + abs(min(liquid_x))
+
+    liquid_x = liquid_x[0::3]
+    liquid_y = liquid_y[0::3]
+    liquid_z = liquid_z[0::3]
+    # x, y, z = np.meshgrid(liquid_x, liquid_y, liquid_z)
+    # x = x.ravel()
+    # y = y.ravel()
+    # z = z.ravel()
+
+    # return x * 1e-3, y * 1e-3, z * 1e-3
+    return liquid_x * 1e-3, liquid_y * 1e-3, liquid_z * 1e-3
 
 
 def create_sphere(dx=0.5):
@@ -64,7 +81,7 @@ def create_sphere(dx=0.5):
     y = y.ravel()
     z = z.ravel()
 
-    p = ((x - 50)**2 + (y - 15)**2 + (z - 20)**2) < 2**2
+    p = ((x - 50)**2 + (y - 100)**2 + (z - 20)**2) < 2**2
     x = x[p]
     y = y[p]
     z = z[p]
@@ -107,10 +124,10 @@ class RigidFluidCoupling(Application):
     def initialize(self):
         self.dx = 2 * 1e-3
         self.hdx = 1.2
-        self.ro = 1000
-        self.solid_rho = 500
+        self.ro = 3000
+        self.solid_rho = 2700
         self.vz = -2.0
-        self.m = 1000 * self.dx * self.dx
+        self.m = 3000 * self.dx * self.dx
         self.co = 2 * np.sqrt(2 * 9.81 * 150 * 1e-3)
         self.alpha = 0.1
 
