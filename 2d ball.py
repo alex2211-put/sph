@@ -109,7 +109,7 @@ def get_projectile_particles():
     u = numpy.ones_like(z) * v_s
 
     pa = projectile = get_particle_array(
-        name="projectile", x=x, y=y, z=z, h=hf, m=mf, rho=rhof, cs=csf, uz=u)
+        name="projectile", x=x, y=y, z=z, h=hf, m=mf, rho=rhof, cs=csf, u=u)
 
     # add requisite properties
     # sound speed etc.
